@@ -1,7 +1,9 @@
+[纺织ERP-AI开发文档.md](https://github.com/user-attachments/files/29734142/ERP-AI.md)
 # 纺织ERP智能管理系统 — 开发文档
 
-> 版本：v1.4 | 日期：2026-06-17 | 作者：开发团队
+> 版本：v1.5 | 日期：2026-07-07 | 作者：吕明远
 > 项目代号：TexERP-AI
+> v1.5 更新：文档评审后修订——修复Token存储矛盾、角色存储冗余、AI服务读写权限、Java版本不符；新增并发控制、软删除、全局异常处理、缓存策略、日志规范、性能SLA、接口幂等性、种子数据设计、柬埔寨部署考量；评分表改追加式写入、QC schema扩展、Redis Stream替代RabbitMQ、AI服务间认证
 > v1.4 更新：合并 JWT 登录认证详细设计文档
 > v1.3 更新：技术评审后修正——补全认证方案(JWT)、数据库迁移(Flyway)、支付记录表、批次追溯关联表、AI降级方案、文件API、排产日历、测试策略、批量操作API、路线图调整为16周
 
@@ -18,6 +20,12 @@
    - 3.4 认证与授权方案 【v1.3】
    - 3.5 数据库迁移方案 【v1.3】
    - 3.6 测试策略 【v1.3】
+   - 3.7 全局异常处理 【v1.5】
+   - 3.8 缓存策略 【v1.5】
+   - 3.9 日志规范 【v1.5】
+   - 3.10 性能需求与 SLA 【v1.5】
+   - 3.11 接口幂等性 【v1.5】
+   - 3.12 种子数据设计 【v1.5】
 4. [功能模块设计](#4-功能模块设计)
    - 4.1 订单管理
    - 4.2 采购管理
@@ -40,11 +48,13 @@
    - 4.19 司机绩效考核 【v1.2 P1】
 5. [AI Agent 设计](#5-ai-agent-设计)
 6. [自动化算法设计](#6-自动化算法设计)
+   - 6.5 并发控制策略 【v1.5】
 7. [数据库设计](#7-数据库设计)
 8. [API 接口设计](#8-api-接口设计)
 9. [开发路线图](#9-开发路线图)
 10. [风险评估与对策](#10-风险评估与对策)
 11. [部署方案](#11-部署方案) 【新增】
+   - 11.5 柬埔寨部署考量 【v1.5】
 12. [遗漏项自查记录](#12-遗漏项自查记录)
 
 ---
@@ -94,7 +104,7 @@
 │                    前端 SPA (Vue 3)                          │
 │              订单工作台 │ 采购面板 │ 排产看板 │ AI分析         │
 └──────────────────────┬──────────────────────────────────────┘
-                       │ HTTPS / WebSocket
+                       │ HTTPS (WebSocket 可选，用于实时通知推送)
 ┌──────────────────────▼──────────────────────────────────────┐
 │                   API Gateway (Nginx)                        │
 └──────┬──────────────────────────────┬───────────────────────┘
@@ -110,7 +120,7 @@
 │  · 权限管理     │          │  · NLP查询接口                 │
 └──────┬──────────┘          └──────────┬────────────────────┘
        │                                │
-       │   RabbitMQ 消息队列             │
+       │   Redis Stream 事件总线        │
        │   (事件驱动自动化)              │
        │                                │
 ┌──────▼────────────────────────────────▼────────────────────┐
@@ -126,7 +136,7 @@
 |------|------|
 | **单体而非微服务** | 团队 1 人开发，微服务运维成本远大于收益。模块化分包，清晰即可 |
 | **AI 独立服务** | Python 生态的 LLM/数据分析库远强于 Java，独立部署不污染主服务 |
-| **事件驱动** | 订单状态变更 → RabbitMQ 事件 → 自动触发下游动作（通知采购、启动排产等） |
+| **事件驱动** | 订单状态变更 → Redis Stream 事件 → 自动触发下游动作（通知采购、启动排产等）。v1.5 起用 Redis Stream 替代 RabbitMQ，单机部署无需额外服务 【v1.5更新】 |
 
 ### 2.3 模块划分
 
@@ -151,14 +161,14 @@ tex-erp/
 
 | 技术 | 版本 | 用途 |
 |------|------|------|
-| Java | 17 LTS | 主力语言 |
+| Java | 21 LTS | 主力语言（编译目标 sourceCompatibility=17 保持兼容） |
 | Spring Boot | 3.2.x | 应用框架 |
 | Spring Security | 6.x | 权限控制（RBAC） |
 | jjwt (jjwt-api / jjwt-impl / jjwt-jackson) | 0.11.5 | JWT 生成解析 |
 | MyBatis-Plus | 3.5.x | ORM，代码生成 |
 | MySQL | 8.0 | 业务数据库 |
 | Redis | 7.x | 缓存 + 分布式锁 |
-| RabbitMQ | 3.12 | 事件总线，异步自动化 |
+| Redis Stream | 7.x 内置 | 事件总线，异步自动化（v1.5 起替代 RabbitMQ，单机部署资源更省） 【v1.5更新】 |
 | Flyway | 9.x | 数据库迁移版本管理 【v1.3新增】 |
 | SpringDoc | 2.3+ | OpenAPI 文档自动生成 【v1.3新增】 |
 | Resilience4j | 2.x | AI 服务熔断降级 【v1.3新增】 |
@@ -173,7 +183,7 @@ tex-erp/
 |------|------|------|
 | Python | 3.12 | AI 服务语言 |
 | FastAPI | 0.110+ | AI API 框架 |
-| SQLAlchemy | 2.0 | 只读连接主库做分析 |
+| SQLAlchemy | 2.0 | 双连接：只读连接查业务数据 + 读写连接写评分表 【v1.5修正】 |
 | scikit-learn | 1.4 | 评分模型、趋势预测 |
 | openai / httpx | - | 对接 LLM（Qwen / DeepSeek） |
 | pandas / numpy | - | 数据分析 |
@@ -188,6 +198,8 @@ tex-erp/
 | ECharts | 5.5 | 数据分析图表 |
 | Axios | 1.6 | HTTP 请求 |
 | Vite | 5.x | 构建工具 |
+| Playwright | 最新版 | E2E 测试（关键流程自动化测试） 【v1.5新增】 |
+| Vitest | 1.x | 前端单元测试（工具函数） 【v1.5新增】 |
 
 ---
 
@@ -214,8 +226,13 @@ tex-erp/
 
 | Token 类型 | 载体 | 有效期 | 存储位置 |
 |-----------|------|--------|----------|
-| Access Token | JWT (HS256) | 30 分钟 | 前端内存 (Pinia) |
-| Refresh Token | UUID | 7 天 | Redis + httpOnly Cookie |
+| Access Token | JWT (HS256) | 30 分钟 | Pinia（内存）+ sessionStorage（刷新不丢失） |
+| Refresh Token | UUID | 7 天 | Redis（服务端）+ httpOnly Cookie（浏览器端，前端 JS 不可读） |
+
+> **【v1.5修正】Token 存储方案统一说明**：
+> - Access Token 不用 localStorage（XSS 风险），不用 httpOnly cookie（与 Bearer Token 方案冲突，前端 JS 无法读取设置 Header）
+> - Pinia 内存存储保证安全性，sessionStorage 兜底保证页面刷新不丢失（关闭标签页自动清除）
+> - Refresh Token 用 httpOnly Cookie 传输，后端从 Cookie 提取，前端 JS 无法读取，防 XSS 盗取
 
 **登录流程：**
 
@@ -223,7 +240,7 @@ tex-erp/
 2. 后端通过 `AuthenticationManager` 调用 `UserDetailsService.loadUserByUsername()` 从数据库查询用户
 3. 使用 `BCryptPasswordEncoder` 比对密码
 4. 认证成功，生成 access_token 和 refresh_token
-5. 返回 `{ accessToken, refreshToken, expiresIn }` 给前端
+5. 返回 `{ accessToken, expiresIn }` 给前端（access_token 存 Pinia+sessionStorage）；同时通过 `Set-Cookie` 将 refresh_token 写入 httpOnly Cookie 【v1.5修正】
 
 **请求认证流程：**
 
@@ -236,11 +253,11 @@ tex-erp/
 **Token 刷新流程：**
 
 1. 前端 Axios 响应拦截器捕获 401
-2. 自动调 `POST /api/auth/refresh`，携带 refresh_token
-3. 后端验证 refresh_token，旧 refresh_token 立即失效
-4. 返回新的 access_token 和 refresh_token（refresh_token 轮换）
-5. 前端更新内存中的 token，重试原请求
-6. 刷新失败 → 清除 token，跳转登录页
+2. 自动调 `POST /api/auth/refresh`，refresh_token 由浏览器自动从 httpOnly Cookie 携带（前端 JS 无需手动传） 【v1.5修正】
+3. 后端从 Cookie 提取 refresh_token 验证，旧 refresh_token 立即失效
+4. 返回新的 access_token；同时通过 `Set-Cookie` 写入新的 refresh_token（refresh_token 轮换）
+5. 前端更新 Pinia/sessionStorage 中的 access_token，重试原请求
+6. 刷新失败 → 清除前端 token，跳转登录页
 
 #### 3.4.3 Token 设计细节
 
@@ -255,7 +272,7 @@ tex-erp/
 
 **密钥管理：**
 - 使用 `application.yml` 中的配置项 `jwt.secret`
-- 密钥长度至少 256 位（32 字符）
+- 密钥长度至少 256 bits（32 字节，即 32 个 ASCII 字符） 【v1.5修正：消除"256位"歧义】
 - 生产环境通过环境变量注入，禁止写入代码仓库
 
 #### 3.4.4 核心类设计
@@ -286,7 +303,7 @@ tex-erp/
 | **production** | 排产查看、生产报工、裁床、计件工资 |
 | **viewer** | 所有模块只读（老板视角） |
 
-权限粒度：菜单级（路由守卫）+ 按钮级（`v-if` 指令）。权限标识存 `t_user.roles`（逗号分隔字符串，一人多角色）。
+权限粒度：菜单级（路由守卫）+ 按钮级（`v-if` 指令）。权限标识通过 `t_user_role` 关联表查询，一人多角色。 【v1.5修正：删除 t_user.roles 冗余字段，统一用关联表】
 
 #### 3.4.6 安全策略
 
@@ -307,7 +324,7 @@ tex-erp/
 
 #### 3.4.7 前端对接规范
 
-**Token 存储：** 本地开发用 localStorage，正式环境优先 httpOnly cookie。
+**Token 存储：** Access Token 存 Pinia（内存）+ sessionStorage（刷新不丢失）；Refresh Token 由后端写入 httpOnly Cookie，前端 JS 不可读。不用 localStorage（XSS 风险）。 【v1.5修正：统一存储方案】
 
 **Axios 拦截器：**
 - 请求拦截器：自动注入 `Authorization: Bearer <token>`
@@ -341,9 +358,9 @@ tex-erp/
 ```yaml
 # application.yml
 jwt:
-  secret: your-256-bit-secret-key-here-min-32-chars
-  access-token-expiration: 1800000    # 30分钟（毫秒）
-  refresh-token-expiration: 604800000 # 7天（毫秒）
+  secret: ${JWT_SECRET}              # 环境变量注入，禁止提交到代码仓库
+  access-token-expiration: 30m       # 30分钟（Duration 格式）
+  refresh-token-expiration: 7d       # 7天（Duration 格式）
 
 # 登录失败限制
 login:
@@ -406,6 +423,87 @@ login:
   Repository: 关键查询 100%
   Controller: 正常/异常路径各一条
   前端: 不追求覆盖率，只测关键路径
+```
+
+---
+
+### 3.7 全局异常处理 【v1.5 新增】
+
+> `@RestControllerAdvice` 统一捕获，所有接口返回标准化错误响应。
+
+| 异常类型 | HTTP 状态码 | 错误码 | 说明 |
+|----------|------------|--------|------|
+| BusinessException | 400 | TEX-{模块}-{序号} | 业务校验失败（如订单状态不允许此操作） |
+| ValidationException | 400 | TEX-VAL-001 | 参数校验失败，返回字段级错误信息 |
+| AuthenticationException | 401 | TEX-AUTH-001 | 认证失败（token 无效/过期） |
+| AccessDeniedException | 403 | TEX-AUTH-002 | 权限不足 |
+| OptimisticLockException | 409 | TEX-CONC-001 | 并发冲突（数据已被他人修改） |
+| Exception | 500 | TEX-SYS-001 | 未预期异常，仅返回"系统繁忙，请稍后重试" |
+
+**日志策略**：5xx 记 ERROR + 完整堆栈；4xx 记 WARN；业务校验记 INFO。
+
+### 3.8 缓存策略 【v1.5 新增】
+
+| 缓存对象 | TTL | 失效策略 | 说明 |
+|----------|-----|----------|------|
+| 数据字典（面料类型/颜色/枚举） | 永不过期 | 变更时主动刷新 | 读多写少 |
+| 用户权限信息 | 30min | 角色变更时刷新 | 减少每次请求查 DB |
+| 供应商/客户评分 | 1h | AI 重算后刷新 | 评分计算后缓存 |
+| 排产结果 | 5min | 排产变更时清除 | 频繁变更，短缓存 |
+| 库存数量 | 不缓存 | — | 强一致性要求，直接查 DB |
+| 空值缓存 | 60s | — | 防缓存穿透 |
+
+**缓存雪崩防护**：TTL 加随机偏移量（±60s），避免同时过期。
+
+### 3.9 日志规范 【v1.5 新增】
+
+```
+日志格式：JSON 结构化（便于后续 ELK 采集）
+日志级别：
+  ERROR  系统异常、第三方调用失败、数据一致性风险
+  WARN   业务异常、降级触发、接近阈值
+  INFO   关键业务操作（订单状态变更、排产确认等）
+  DEBUG  调试信息（生产默认关闭）
+
+敏感信息脱敏：密码、token、手机号中间四位
+日志保留：ERROR 90天，INFO 30天，DEBUG 7天
+日志存储：本地文件 + 按天滚动（单机部署暂不上 ELK）
+```
+
+### 3.10 性能需求与 SLA 【v1.5 新增】
+
+| 指标 | 目标 | 说明 |
+|------|------|------|
+| 列表查询（分页） | P95 < 500ms | 订单/采购/库存列表 |
+| 详情查询（单条+关联） | P95 < 300ms | 订单详情含参数/打板/采购 |
+| 排产算法（100订单×10产线） | < 3s | 贪心+约束算法 |
+| AI 评分计算 | P95 < 5s | 含数据库查询+模型计算 |
+| Excel 导入（1000行） | < 10s | 含校验+入库 |
+| 并发支持 | 50 并发用户 | 工厂规模 |
+| 数据量预估 | 3年 ~50万订单 | ~500万条明细行 |
+
+### 3.11 接口幂等性 【v1.5 新增】
+
+> 写操作支持客户端传递 `requestId`（UUID），防止网络重试导致重复数据。
+
+```
+方案：
+  - 客户端每次写操作生成 requestId（UUID）
+  - 服务端用 Redis 记录 requestId（TTL 10min）
+  - 相同 requestId 的重复请求直接返回首次结果
+  - 至少覆盖：创建订单、入库、出库、报工、收付款登记
+```
+
+### 3.12 种子数据设计 【v1.5 新增】
+
+```
+init.sql 包含以下种子数据：
+├── 初始管理员账户（admin/admin123 BCrypt加密，首次登录强制改密）
+├── 角色数据（admin/pmc/procurement/warehouse/production/viewer 6个角色）
+├── 数据字典（面料类型、颜色、单位、QC检查项类型等枚举 INSERT）
+├── 默认 QC 标准模板（通用标准一套）
+├── 默认系统参数（损耗率默认值、安全库存系数、预警阈值等）
+└── 产线日历初始化（当年工作日历，可批量生成，支持手动调整）
 ```
 
 ---
@@ -990,7 +1088,10 @@ w = {"付款": 0.30, "变更": 0.20, "退货": 0.20, "利润": 0.15, "沟通": 0
 
 ```python
 def match_order_to_line(order, lines):
-    """为订单推荐最优产线"""
+    """为订单推荐最优产线
+    返回: List[(line, score)]，按 score 降序排列
+    score 范围: 0-100，各维度返回值归一化到 0.0-1.0 后乘以权重
+    """
     scores = []
     for line in lines:
         score = 0
@@ -1049,6 +1150,32 @@ AI 自然语言查询不可用时:
   failureRateThreshold: 50%     # 滑动窗口内 50% 失败就熔断
   waitDurationInOpenState: 60s  # 60 秒后半开试探
   slidingWindowSize: 10         # 最近 10 次请求统计
+```
+
+### 5.7.1 AI 服务间认证 【v1.5 新增】
+
+> Java 调 Python AI 服务需认证，防止内网未授权调用。
+
+```
+方案：内部 API Key 认证
+  - Java 和 Python 共享内部密钥（环境变量 AI_INTERNAL_KEY 注入）
+  - Java 调 Python 时 Header 携带 X-Internal-Key: <key>
+  - Python 用 FastAPI Dependency 校验，不通过返回 403
+  - Nginx 层限制 /ai/* 只允许本机访问（deny all; allow 127.0.0.1）
+```
+
+### 5.7.2 AI 服务数据库连接 【v1.5 修正 A4】
+
+> AI 服务需要两个数据库连接：只读查业务数据 + 读写写评分结果。
+
+```
+ai_readonly:  SQLAlchemy 引擎 → MySQL 用户 tex_ai_ro，只有 SELECT 权限
+              用途：查订单、质检、库存等业务数据做分析
+
+ai_write:     SQLAlchemy 引擎 → MySQL 用户 tex_ai_rw，有 SELECT + INSERT + UPDATE 权限
+              用途：写入 t_customer_score / t_supplier_score / t_line_capability / t_score_feedback
+
+权限粒度：MySQL 用户级别控制，最小权限原则
 ```
 
 ### 5.8 AI 评分模型评估 【v1.3 技术评审 P2-10】
@@ -1195,6 +1322,36 @@ CREATE TABLE t_score_feedback (
 适用规模：日排程 100+ 订单，10+ 产线，秒级出结果
 ```
 
+### 6.5 并发控制策略 【v1.5 新增】
+
+> ERP 核心场景涉及并发写入，不做并发控制 = 数据不一致。
+
+| 场景 | 并发风险 | 控制方案 |
+|------|----------|----------|
+| 库存扣减/入库 | 超卖、重复入库 | 乐观锁（`version` 字段）+ 数据库行级锁 `SELECT ... FOR UPDATE` |
+| 订单状态变更 | 两人同时操作同一订单 | 状态机校验 `from_status` + 乐观锁，变更时 WHERE version=? |
+| 排产调整 | 多人同时拖拽甘特图 | 行锁 + 前端操作锁（Redis 分布式锁 `lock:schedule:{lineId}` TTL 30s） |
+| 计件工资报工 | 重复报工 | 唯一约束 `(worker_id, production_id, process_step, report_date)` |
+| 采购单确认 | 重复确认 | 状态机 + 乐观锁 |
+
+**乐观锁实现（MyBatis-Plus @Version）：**
+```java
+@Version
+private Integer version;
+// UPDATE t_order SET status=?, version=version+1 WHERE id=? AND version=?
+// 影响行数=0 → 抛出 OptimisticLockException → 前端提示"数据已被他人修改，请刷新后重试"
+```
+
+**统一审计字段规范 【v1.5新增】：**
+所有业务表统一包含以下字段，由 MyBatis-Plus `MetaObjectHandler` 自动填充：
+```sql
+created_by  BIGINT COMMENT '创建人ID',
+created_at  DATETIME DEFAULT CURRENT_TIMESTAMP,
+updated_by  BIGINT COMMENT '更新人ID',
+updated_at  DATETIME ON UPDATE CURRENT_TIMESTAMP,
+deleted_at  DATETIME COMMENT '软删除时间 NULL=未删除（@TableLogic）'
+```
+
 ---
 
 ## 7. 数据库设计
@@ -1229,10 +1386,12 @@ CREATE TABLE t_user (
     nickname        VARCHAR(50) COMMENT '昵称',
     email           VARCHAR(100) COMMENT '邮箱',
     phone           VARCHAR(20) COMMENT '手机号',
-    roles           VARCHAR(255) COMMENT '角色列表，逗号分隔',
     status          TINYINT DEFAULT 1 COMMENT '0-禁用 1-启用',
+    created_by      BIGINT COMMENT '创建人ID',
     created_at      DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_by      BIGINT COMMENT '更新人ID',
     updated_at      DATETIME ON UPDATE CURRENT_TIMESTAMP,
+    deleted_at      DATETIME COMMENT '软删除时间 NULL=未删除',
     UNIQUE KEY uk_username (username)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='用户表';
 ```
@@ -1273,15 +1432,19 @@ CREATE TABLE t_order (
     width_cm        DECIMAL(8,2) COMMENT '门幅 cm',
     quantity_kg     DECIMAL(12,2) COMMENT '数量(kg)',
     order_amount    DECIMAL(12,2) COMMENT '订单金额(元) 【v1.3新增】',
+    currency        VARCHAR(8) DEFAULT 'CNY' COMMENT '币种 CNY/USD/KHR 【v1.5新增-柬埔寨部署】',
     delivery_date   DATE COMMENT '交期',
     priority        TINYINT DEFAULT 0 COMMENT '优先级 0普通 1急单 2特急',
     status          VARCHAR(32) NOT NULL COMMENT '状态见状态机',
+    version         INT DEFAULT 0 COMMENT '乐观锁版本号 【v1.5新增-并发控制】',
     confirmed_at    DATETIME COMMENT '确认时间 【v1.3新增】',
     completed_at    DATETIME COMMENT '完成时间 【v1.3新增】',
     remark          TEXT,
     created_by      BIGINT,
     created_at      DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_by      BIGINT COMMENT '更新人ID 【v1.5新增】',
     updated_at      DATETIME ON UPDATE CURRENT_TIMESTAMP,
+    deleted_at      DATETIME COMMENT '软删除时间 NULL=未删除 【v1.5新增】',
     INDEX idx_status (status),
     INDEX idx_customer (customer_id),
     INDEX idx_delivery (delivery_date),
@@ -1321,9 +1484,11 @@ CREATE TABLE t_supplier_score (
     sample_count        INT COMMENT '样本量(批次)',
     trend               VARCHAR(16) COMMENT '趋势: UP/STABLE/DOWN',
     risk_flag           VARCHAR(16) COMMENT 'NORMAL/WARNING/DANGER',
+    is_latest           TINYINT DEFAULT 1 COMMENT '1=最新版本 0=历史版本 【v1.5新增】',
     calculated_at       DATETIME COMMENT '计算时间',
-    INDEX idx_supplier (supplier_id)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='供应商评分(AI维护)';
+    INDEX idx_supplier_latest (supplier_id, is_latest),
+    INDEX idx_supplier_time (supplier_id, calculated_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='供应商评分(AI维护, 追加式写入保留历史)';
 ```
 
 #### 客户评分表 (t_customer_score) — Agent 维护
@@ -1339,9 +1504,11 @@ CREATE TABLE t_customer_score (
     communication_cost  DECIMAL(5,2) COMMENT '沟通成本评分',
     composite_score     DECIMAL(5,2) COMMENT '综合评分 0-100',
     difficulty_label    VARCHAR(16) COMMENT '标签: EASY/NORMAL/WATCH/RISKY',
+    is_latest           TINYINT DEFAULT 1 COMMENT '1=最新版本 0=历史版本 【v1.5新增】',
     calculated_at       DATETIME,
-    INDEX idx_customer (customer_id)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='客户评分(AI维护)';
+    INDEX idx_customer_latest (customer_id, is_latest),
+    INDEX idx_customer_time (customer_id, calculated_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='客户评分(AI维护, 追加式写入保留历史)';
 ```
 
 #### 产线能力表 (t_line_capability) — Agent 维护
@@ -1355,9 +1522,12 @@ CREATE TABLE t_line_capability (
     quality_rate      DECIMAL(5,4) COMMENT '品质良率',
     delivery_rate     DECIMAL(5,4) COMMENT '交期达成率',
     efficiency_trend  VARCHAR(16) COMMENT '效率趋势',
+    is_latest         TINYINT DEFAULT 1 COMMENT '1=最新版本 0=历史版本 【v1.5新增】',
     calculated_at     DATETIME,
-    UNIQUE KEY uk_line_fabric (line_id, fabric_type)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='产线能力(AI维护)';
+    INDEX idx_line_fabric_latest (line_id, fabric_type, is_latest),
+    INDEX idx_line_time (line_id, calculated_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='产线能力(AI维护, 追加式写入保留历史)';
+```
 
 #### BOM 主表 (t_bom) 【v1.1 新增】
 
@@ -1407,8 +1577,7 @@ CREATE TABLE t_order_cost (
     packaging_cost      DECIMAL(12,2) DEFAULT 0 COMMENT '包装成本',
     logistics_cost      DECIMAL(12,2) DEFAULT 0 COMMENT '物流成本',
     total_cost          DECIMAL(12,2) DEFAULT 0 COMMENT '总成本',
-    order_amount        DECIMAL(12,2) COMMENT '订单金额',
-    gross_profit        DECIMAL(12,2) COMMENT '毛利',
+    gross_profit        DECIMAL(12,2) COMMENT '毛利(计算时从t_order.order_amount获取)',
     profit_rate         DECIMAL(5,4) COMMENT '毛利率',
     calculated_at       DATETIME,
     INDEX idx_order (order_id)
@@ -1434,10 +1603,12 @@ CREATE TABLE t_qc_standard (
 CREATE TABLE t_qc_standard_item (
     id              BIGINT PRIMARY KEY AUTO_INCREMENT,
     standard_id     BIGINT NOT NULL,
-    item_name       VARCHAR(64) NOT NULL COMMENT '检查项: 色牢度/色差/门幅偏差',
+    item_name       VARCHAR(64) NOT NULL COMMENT '检查项: 色牢度/色差/门幅偏差/外观疵点',
+    check_type      VARCHAR(16) DEFAULT 'RANGE' COMMENT '判定方式: RANGE(范围)/BOOLEAN(合格不合格)/ENUM(枚举)/TEXT(文字描述) 【v1.5新增】',
     item_unit       VARCHAR(16) COMMENT '单位',
-    min_value       DECIMAL(10,4) COMMENT '合格下限',
-    max_value       DECIMAL(10,4) COMMENT '合格上限',
+    min_value       DECIMAL(10,4) COMMENT '合格下限(RANGE类型用)',
+    max_value       DECIMAL(10,4) COMMENT '合格上限(RANGE类型用)',
+    pass_value      VARCHAR(64) COMMENT '合格值(BOOLEAN=pass/fail, ENUM=逗号分隔合格值) 【v1.5新增】',
     INDEX idx_standard (standard_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='QC标准检查项';
 ```
@@ -1700,7 +1871,6 @@ CREATE TABLE t_line_calendar (
     UNIQUE KEY uk_line_date (line_id, calendar_date)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='产线工作日历';
 ```
-```
 
 > 其他表：客户表、供应商表、物料表、采购单表、入库单表、出库单表、质检单表、产线表、生产工单表、用户表、角色表等，按规范设计，此处不全部展开。
 
@@ -1781,6 +1951,7 @@ GET    /api/v1/ai/procurement/recommend     采购智能推荐(传入订单ID)
 GET    /api/v1/ai/schedule/optimize         排产优化建议
 GET    /api/v1/ai/alerts                    当前活跃预警列表
 POST   /api/v1/ai/query                     自然语言查询
+```
 
 #### BOM 管理 【v1.1 新增】
 
@@ -1927,7 +2098,6 @@ DELETE /api/v1/files/{fileKey}               删除文件
 PUT    /api/v1/orders/batch-status            批量变更订单状态
 PUT    /api/v1/orders/batch-assign            批量分配跟单员
 GET    /api/v1/export/orders-batch            批量导出订单(勾选导出)
-```
 ```
 
 ### 8.3 AI 查询接口示例
@@ -2095,8 +2265,11 @@ Week 14-16:
 │  Python AI  (8000, uvicorn)               │
 │  MySQL      (3306)                        │
 │  Redis      (6379)                        │
-│  RabbitMQ   (5672)                        │
 │  MinIO      (9000)                        │
+│                                           │
+│  事件总线：Redis Stream（替代 RabbitMQ）    │
+│  【v1.5修正：单机4C8G跑RabbitMQ偏重，     │
+│   改用已有Redis的Stream功能，零额外资源】  │
 └──────────────────────────────────────────┘
 ```
 
@@ -2113,11 +2286,11 @@ Week 14-16:
 ```
 1. MySQL 建库 + 执行 init.sql（建表 + 基础数据字典）
 2. MinIO 创建 bucket: tex-erp-files
-3. RabbitMQ 创建 exchange/queue
-4. 配置 application.yml（数据库连接、AI服务地址）
-5. 配置 AI 服务 .env（LLM API Key、数据库只读连接）
+3. Redis Stream 创建消费者组（XGROUP CREATE）
+4. 配置 application.yml（数据库连接、AI服务地址、JWT密钥）
+5. 配置 AI 服务 .env（LLM API Key、双数据库连接、AI_INTERNAL_KEY） 【v1.5修正】
 6. 启动 Spring Boot → 启动 Python AI → 部署前端静态文件
-7. 创建管理员账户 → 录入基础数据 → 开用
+7. 创建管理员账户（admin/admin123，首次登录强制改密） → 录入基础数据 → 开用
 ```
 
 ### 11.4 多单位换算 【v1.1 补充】
@@ -2137,9 +2310,45 @@ Week 14-16:
 - 转换系数: t_material 表存储转换公式
 ```
 
+### 11.5 柬埔寨部署考量 【v1.5 新增】
+
+> 当前在柬埔寨为当地同事部署系统，需考虑跨国环境差异。
+
+| 维度 | 考量 | 方案 |
+|------|------|------|
+| **时区** | 柬埔寨 UTC+7，中国 UTC+8 | 数据库存 UTC，应用层 `application.yml` 配 `spring.jackson.time-zone=Asia/Shanghai`；若柬方独立运营则配 `Asia/Phnom_Penh`。日期字段（delivery_date 等）在 API 层统一转换 |
+| **多币种** | 柬埔寨用 USD/KHR，国内用 CNY | 金额字段增加 `currency`（已加到 t_order）；汇率表 `t_exchange_rate` 手动维护，成本/对账按币种分别统计 |
+| **网络** | 柬埔寨→国内 LLM API 延迟和稳定性 | 考虑本地 embedding 模型作为 fallback；LLM 查询增加超时 30s + 降级提示；核心评分不依赖 LLM |
+| **语言** | 柬埔寨同事可能需要高棉语 | v1 仅中文，前端 i18n 预留接口（`vue-i18n`），后续按需加高棉语包 |
+| **数据合规** | 柬埔寨当地数据驻留要求 | 目前单机本地部署，数据不出境；如需回传国内，需确认合规要求 |
+| **离线容灾** | 柬埔寨网络不稳定 | 核心业务（下单/入库/排产）不依赖外网；AI 功能降级后仍可正常运营 |
+
 ---
 
-## 12. 遗漏项自查记录 【v1.4 更新】
+## 12. 遗漏项自查记录 【v1.5 更新】
+
+**v1.5 新增（文档评审修订）：**
+
+| # | 遗漏项 | 影响 | 版本 |
+|---|--------|------|------|
+| 35 | **Token 存储方案矛盾** | 三处描述不一致，开发踩坑 | v1.5 §3.4.2/3.4.7 |
+| 36 | **角色存储冗余** | t_user.roles + t_user_role 并存 | v1.5 §3.4.5/§7.2 |
+| 37 | **AI 服务读写权限矛盾** | 只读连接写不了评分表 | v1.5 §3.2/§5.7.2 |
+| 38 | **Java 版本不符** | 文档17 vs 实际21 | v1.5 §3.1 |
+| 39 | **并发控制缺失** | 库存超卖/订单状态竞争 | v1.5 §6.5 |
+| 40 | **评分表无历史版本** | 趋势分析无数据 | v1.5 §7.2 |
+| 41 | **软删除/审计字段缺失** | 数据误删不可恢复/责任无法追溯 | v1.5 §6.5/§7.2 |
+| 42 | **QC schema 不完整** | 无法覆盖布尔/枚举判定 | v1.5 §7.2 |
+| 43 | **RabbitMQ 单机过重** | 4C8G 资源紧张 | v1.5 §11.1 |
+| 44 | **AI 服务间无认证** | 内网未授权调用风险 | v1.5 §5.7.1 |
+| 45 | **全局异常处理缺失** | 错误响应不统一 | v1.5 §3.7 |
+| 46 | **缓存策略缺失** | 无缓存使用规范 | v1.5 §3.8 |
+| 47 | **日志规范缺失** | 无系统日志标准 | v1.5 §3.9 |
+| 48 | **性能 SLA 缺失** | 无法判断性能是否达标 | v1.5 §3.10 |
+| 49 | **接口幂等性缺失** | 网络重试导致重复数据 | v1.5 §3.11 |
+| 50 | **种子数据缺失** | 首次部署无初始数据 | v1.5 §3.12 |
+| 51 | **柬埔寨部署考量缺失** | 时区/币种/网络/语言未规划 | v1.5 §11.5 |
+| 52 | **金额字段冗余** | t_order_cost.order_amount 重复 | v1.5 §7.2 |
 
 **v1.4 新增：**
 
@@ -2195,7 +2404,7 @@ Week 14-16:
 - 客户授信额度（下单自动控额，v2 迭代）
 - 扫码报工 H5（工人手机扫码报产量，v2 迭代）
 - t_bom.fabric_type 改为外键 ID（当前 VARCHAR 做唯一键不够稳，v2 迭代） 【v1.3 已知】
-- SpringDoc 全局异常响应体标准化 【v1.3 已知】
+- SpringDoc 全局异常响应体标准化 【v1.3 已知 → v1.5 已解决，见 §3.7】
 
 ---
 
@@ -2220,5 +2429,5 @@ Week 14-16:
 
 ---
 
-> **文档状态**：v1.4，已合并 JWT 登录认证详细设计
+> **文档状态**：v1.5，已完成文档评审修订（30项问题修复），可进入开发
 > **下一步**：确认技术选型 → 搭建项目骨架 → 进入阶段一开发
